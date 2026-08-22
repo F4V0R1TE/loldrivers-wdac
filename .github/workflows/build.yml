@@ -1,0 +1,152 @@
+name: build
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Generate policies
+        shell: powershell
+        run: python generate.py --out-dir build
+
+      - name: Verify rule options
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $audit = [xml](Get-Content build/LOLDrivers-Audit.xml)
+          $enforced = [xml](Get-Content build/LOLDrivers-Enforced.xml)
+          if ($audit.SiPolicy.Rules.Rule.Option -notcontains 'Enabled:Audit Mode') {
+            throw 'Audit policy is missing Enabled:Audit Mode'
+          }
+          if ($enforced.SiPolicy.Rules.Rule.Option -contains 'Enabled:Audit Mode') {
+            throw 'Enforced policy must not contain Enabled:Audit Mode'
+          }
+          if ($audit.SiPolicy.PolicyID -ne $enforced.SiPolicy.PolicyID) {
+            throw 'PolicyID mismatch between variants'
+          }
+          $denyCount = @($enforced.SiPolicy.FileRules.Deny).Count
+          if ($denyCount -lt 1000) {
+            throw "Unexpectedly low deny rule count: $denyCount"
+          }
+          Write-Host "Deny rules: $denyCount"
+
+      - name: Compile policies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $policyId = ([xml](Get-Content build/LOLDrivers-Enforced.xml)).SiPolicy.PolicyID
+          $name = "$policyId.cip"
+          New-Item -ItemType Directory -Path build/audit, build/enforced | Out-Null
+          ConvertFrom-CIPolicy -XmlFilePath build/LOLDrivers-Audit.xml -BinaryFilePath "build/audit/$name"
+          ConvertFrom-CIPolicy -XmlFilePath build/LOLDrivers-Enforced.xml -BinaryFilePath "build/enforced/$name"
+          Move-Item build/LOLDrivers-Audit.xml build/audit/LOLDrivers-Audit.xml
+          Move-Item build/LOLDrivers-Enforced.xml build/enforced/LOLDrivers-Enforced.xml
+
+      - name: Detect ruleset change
+        id: state
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $xml = [xml](Get-Content build/enforced/LOLDrivers-Enforced.xml)
+          $joined = ($xml.SiPolicy.FileRules.Deny.Hash | Sort-Object) -join ''
+          $stream = [System.IO.MemoryStream]::new([System.Text.Encoding]::ASCII.GetBytes($joined))
+          $digest = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash
+          $stream.Dispose()
+          $previous = ''
+          if (Test-Path policies/ruleset.sha256) {
+            $previous = (Get-Content policies/ruleset.sha256 -Raw).Trim()
+          }
+          $version = $xml.SiPolicy.VersionEx
+          $count = @($xml.SiPolicy.FileRules.Deny).Count
+          $changed = ($digest -ne $previous).ToString().ToLower()
+          Set-Content -Path build/ruleset.sha256 -Value $digest -NoNewline
+          "changed=$changed" | Out-File $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
+          "count=$count" | Out-File $env:GITHUB_OUTPUT -Append
+          $parts = $version.Split('.')
+          $date = '{0}-{1:d2}-{2:d2}' -f $parts[1], [int]$parts[2], [int]$parts[3]
+          "date=$date" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Version:        $version"
+          Write-Host "Ruleset digest: $digest"
+          Write-Host "Changed:        $changed"
+
+      - name: Commit policies
+        if: steps.state.outputs.changed == 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "policies/${{ steps.state.outputs.date }}"
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item build/audit, build/enforced -Destination $dir -Recurse -Force
+          Copy-Item build/skipped.md $dir -Force
+          Copy-Item build/ruleset.sha256 policies/ruleset.sha256 -Force
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add policies
+          git commit -m "Add policy ${{ steps.state.outputs.date }} (${{ steps.state.outputs.count }} deny rules)"
+          git push
+
+      - name: Publish release
+        if: steps.state.outputs.changed == 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tag = "v${{ steps.state.outputs.version }}"
+          $title = "${{ steps.state.outputs.version }}"
+          New-Item -ItemType Directory -Path assets | Out-Null
+          $dir = "policies/${{ steps.state.outputs.date }}"
+          Compress-Archive -Path "$dir/audit/*" -DestinationPath assets/LOLDrivers-Audit.zip
+          Compress-Archive -Path "$dir/enforced/*" -DestinationPath assets/LOLDrivers-Enforced.zip
+          Copy-Item "$dir/skipped.md" assets/skipped.md
+          $files = (Get-ChildItem assets -File).FullName
+          $lines = @(
+            'WDAC deny policy generated from the LOLDrivers data set of ${{ steps.state.outputs.date }}.'
+            ''
+            '| | |'
+            '|---|---|'
+            '| Policy version | `${{ steps.state.outputs.version }}` |'
+            '| Deny rules | ${{ steps.state.outputs.count }} |'
+            '| Enforcement | kernel mode only (KMCI) |'
+            ''
+            'Each archive contains the policy XML and the compiled `.cip`.'
+            'Roll out `LOLDrivers-Audit.zip` first and review the CodeIntegrity'
+            'event log before switching to the enforced variant.'
+            ''
+          )
+          $skipped = @(Get-Content "$dir/skipped.md" | Select-Object -Skip 1)
+          if ($skipped.Count -gt 260) {
+            $skipped = $skipped[0..259] + @('', '_List truncated, see the attached skipped.md for the full list._')
+          }
+          $lines += @('', '## Skipped samples') + $skipped
+          Set-Content -Path notes.md -Value $lines -Encoding utf8
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $files --clobber
+          } else {
+            gh release create $tag --title $title --notes-file notes.md $files
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh exited with code $LASTEXITCODE"
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: policies
+          path: build/
+          retention-days: 30
